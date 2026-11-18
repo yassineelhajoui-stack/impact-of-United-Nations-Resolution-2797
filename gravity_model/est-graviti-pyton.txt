@@ -1,0 +1,152 @@
+"""
+Ré-estimation indépendante du modèle de gravité intra-UMA avec effets fixes
+exportateur-année / importateur-année (gravité structurelle), en réponse aux
+remarques des Réviseurs 1 et 2 sur l'article :
+"Les bénéfices d'une revitalisation de l'Union du Maghreb arabe..."
+
+Source de données : CEPII Gravity Database, version publique V202211
+(Conte, Cotterlaz & Mayer, 2022)
+https://www.cepii.fr/CEPII/en/bdd_modele/bdd_modele_item.asp?id=8
+
+Ce script :
+  1. Télécharge et filtre le panel CEPII Gravity (2000-2019, pays existants,
+     hors auto-commerce).
+  2. Construit les variables identiques à celles du modèle original
+     (ln PIB, ln population, ln distance, langue/frontière/colonisation
+     communes et leurs interactions, fta_wto).
+  3. Estime quatre modèles PPML :
+       - EX baseline (réplication de la spécification originale, sans EF)
+       - IM baseline (idem, importations)
+       - EX structurel (EF exportateur-année + importateur-année)
+       - IM structurel (idem, importations)
+  4. Calcule le ratio commerce effectif / commerce potentiel pour les
+     5 pays de l'UMA (agrégé et par pays), pour les quatre spécifications,
+     et un test de robustesse avec les flux BACI en variable dépendante
+     alternative.
+
+Dépendances : pandas, numpy, pyfixest, pyarrow
+    pip install pandas numpy pyfixest pyarrow --break-system-packages
+
+Auteur : révision assistée, pour vérification indépendante par les auteurs.
+"""
+
+import os
+import zipfile
+import urllib.request
+import pandas as pd
+import numpy as np
+import pyfixest as pf
+
+DATA_URL = "https://www.cepii.fr/DATA_DOWNLOAD/gravity/data/Gravity_csv_V202211.zip"
+WORKDIR = "./gravity_work"
+UMA = ["DZA", "LBY", "MAR", "MRT", "TUN"]
+YEAR_MIN, YEAR_MAX = 2000, 2019
+
+
+def download_and_extract():
+    os.makedirs(WORKDIR, exist_ok=True)
+    zip_path = os.path.join(WORKDIR, "gravity.zip")
+    if not os.path.exists(zip_path):
+        print("Téléchargement du jeu de données CEPII Gravity (~200 Mo)...")
+        urllib.request.urlretrieve(DATA_URL, zip_path)
+    extract_dir = os.path.join(WORKDIR, "gravity_data")
+    if not os.path.exists(extract_dir):
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(extract_dir)
+    return os.path.join(extract_dir, "Gravity_V202211.csv")
+
+
+def load_filtered_panel(csv_path):
+    cols = ["year", "iso3_o", "iso3_d", "country_exists_o", "country_exists_d",
+            "contig", "comlang_off", "comcol", "col45", "distw_harmonic", "distcap",
+            "pop_o", "pop_d", "gdp_o", "gdp_d", "fta_wto",
+            "tradeflow_imf_o", "tradeflow_imf_d", "tradeflow_baci"]
+    chunks = []
+    for chunk in pd.read_csv(csv_path, usecols=cols, chunksize=500_000, low_memory=False):
+        chunk = chunk[(chunk.year >= YEAR_MIN) & (chunk.year <= YEAR_MAX)]
+        chunk = chunk[chunk.iso3_o != chunk.iso3_d]
+        chunk = chunk[(chunk.country_exists_o == 1) & (chunk.country_exists_d == 1)]
+        chunks.append(chunk)
+    return pd.concat(chunks, ignore_index=True)
+
+
+def build_variables(df):
+    df = df.copy()
+    df["dist"] = df["distw_harmonic"].fillna(df["distcap"])
+    df["CC"] = df["comcol"].fillna(0).astype(int)      # colonisation commune post-1945
+    df["LC"] = df["comlang_off"].fillna(0).astype(int)  # langue officielle commune
+    df["FC"] = df["contig"].fillna(0).astype(int)       # frontière commune
+    df["fta_wto"] = df["fta_wto"].fillna(0).astype(int)
+    df["FCLC"] = df.FC * df.LC
+    df["CCFC"] = df.CC * df.FC
+    df["CCLC"] = df.CC * df.LC
+    df["CCLCFC"] = df.CC * df.LC * df.FC
+    for v in ["pop_o", "pop_d", "gdp_o", "gdp_d", "dist"]:
+        df = df[df[v] > 0]
+    df["ln_pop_o"] = np.log(df.pop_o)
+    df["ln_pop_d"] = np.log(df.pop_d)
+    df["ln_pib_o"] = np.log(df.gdp_o)
+    df["ln_pib_d"] = np.log(df.gdp_d)
+    df["ln_D"] = np.log(df.dist)
+    df["exp_year"] = df.iso3_o + "_" + df.year.astype(str)
+    df["imp_year"] = df.iso3_d + "_" + df.year.astype(str)
+    return df
+
+
+BASE_VARS = "ln_pop_o + ln_pop_d + ln_pib_o + ln_pib_d + fta_wto + CC + LC + FC + FCLC + CCFC + CCLC + CCLCFC + ln_D"
+FE_VARS = "fta_wto + CC + LC + FC + FCLC + CCFC + CCLC + CCLCFC + ln_D"
+
+
+def fit_models(df, dep_var):
+    dfx = df.dropna(subset=[dep_var, "ln_pop_o", "ln_pop_d", "ln_pib_o", "ln_pib_d", "ln_D"]).copy()
+    m_base = pf.fepois(f"{dep_var} ~ {BASE_VARS}", data=dfx, vcov={"CRV1": "iso3_o+iso3_d"})
+    m_fe = pf.fepois(f"{dep_var} ~ {FE_VARS} | exp_year + imp_year", data=dfx, vcov={"CRV1": "iso3_o+iso3_d"})
+    dfx["pred_base"] = m_base.predict(newdata=dfx, type="response")
+    dfx["pred_fe"] = m_fe.predict(newdata=dfx, type="response")
+    return m_base, m_fe, dfx
+
+
+def potential_ratio(df, dep_var, pred_col):
+    uma = df[(df.iso3_o.isin(UMA)) & (df.iso3_d.isin(UMA))]
+    out = {"aggregate": uma[dep_var].sum() / uma[pred_col].sum()}
+    for c in UMA:
+        sub = uma[uma.iso3_o == c]
+        if len(sub):
+            out[c] = sub[dep_var].sum() / sub[pred_col].sum()
+    return out
+
+
+def main():
+    csv_path = download_and_extract()
+    print("Chargement et filtrage du panel (2000-2019)...")
+    raw = load_filtered_panel(csv_path)
+    df = build_variables(raw)
+    print(f"Panel final : {df.shape[0]} observations")
+
+    df["EX"] = df["tradeflow_imf_o"]
+    df["IM"] = df["tradeflow_imf_d"]
+    df["TRD_BACI"] = df["tradeflow_baci"]
+
+    print("\n=== Estimation EXPORTS (tradeflow_imf_o) ===")
+    m_ex_base, m_ex_fe, df_ex = fit_models(df, "EX")
+    print(m_ex_base.summary())
+    print(m_ex_fe.summary())
+
+    print("\n=== Estimation IMPORTS (tradeflow_imf_d) ===")
+    m_im_base, m_im_fe, df_im = fit_models(df, "IM")
+    print(m_im_base.summary())
+    print(m_im_fe.summary())
+
+    print("\n=== Ratios de potentiel commercial intra-UMA (2000-2019) ===")
+    print("EXPORTS - baseline :", potential_ratio(df_ex, "EX", "pred_base"))
+    print("EXPORTS - structurel (EF) :", potential_ratio(df_ex, "EX", "pred_fe"))
+    print("IMPORTS - baseline :", potential_ratio(df_im, "IM", "pred_base"))
+    print("IMPORTS - structurel (EF) :", potential_ratio(df_im, "IM", "pred_fe"))
+
+    print("\n=== Robustesse : flux BACI (harmonisés) en variable dépendante ===")
+    m_baci_base, m_baci_fe, df_baci = fit_models(df, "TRD_BACI")
+    print("BACI - structurel (EF) :", potential_ratio(df_baci, "TRD_BACI", "pred_fe"))
+
+
+if __name__ == "__main__":
+    main()

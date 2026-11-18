@@ -1,0 +1,397 @@
+"""
+Ré-estimation du modèle de gravité intra-UMA et calcul du potentiel commercial
+— script unique (estimation + tableaux + figures), en réponse aux remarques
+des Réviseurs 1 et 2 sur l'article :
+"Les bénéfices d'une revitalisation de l'Union du Maghreb arabe..."
+
+Source de données : CEPII Gravity Database, version publique V202211
+(Conte, Cotterlaz & Mayer, 2022)
+https://www.cepii.fr/CEPII/en/bdd_modele/bdd_modele_item.asp?id=8
+
+Ce script fait tout, dans l'ordre :
+  1. Télécharge et filtre le panel CEPII Gravity (2000-2019, pays existants,
+     hors auto-commerce).
+  2. Construit les variables identiques à celles du modèle original
+     (ln PIB, ln population, ln distance, langue/frontière/colonisation
+     communes et leurs interactions, fta_wto).
+  3. Estime quatre modèles PPML :
+       - EX baseline (réplication de la spécification originale, sans EF)
+       - IM baseline (idem, importations)
+       - EX structurel (EF exportateur-année + importateur-année)
+       - IM structurel (idem, importations)
+     + un test de robustesse avec les flux BACI en variable dépendante.
+  4. Calcule le ratio commerce effectif / commerce potentiel :
+       - agrégé UMA et par pays exportateur (fonction potential_ratio)
+       - bilatéral, paire par paire, exportateur -> importateur
+         (fonction bilateral_potential)
+     pour les quatre spécifications, et exporte deux CSV :
+       - potentiel_agrege_uma.csv
+       - potentiel_bilateral_uma.csv (avec ratio_potentiel et ratio_potentiel_pct)
+  5. Produit trois figures (spécification à effets fixes = la plus fiable
+     méthodologiquement, sauf la première qui compare les deux spécifications) :
+       - figure_ratio_agrege.png       : ratio agrégé UMA, exports/imports,
+                                          baseline vs effets fixes
+       - figure_ratio_pays.png         : ratio par pays exportateur, effets fixes,
+                                          exports vs imports
+       - figure_bilateral_heatmap.png  : matrice 5x5 des ratios bilatéraux (%),
+                                          exportateur en ligne, importateur en
+                                          colonne, effets fixes, exports
+
+Dépendances :
+    pip install pandas numpy pyfixest pyarrow matplotlib --break-system-packages
+
+Usage :
+    python3 gravity_potentiel_uma.py
+(télécharge le panel CEPII la première fois — ~200 Mo, prévoir quelques minutes ;
+ les téléchargements/extractions suivants réutilisent le cache local ./gravity_work)
+
+Auteur : révision assistée, pour vérification indépendante par les auteurs.
+"""
+
+import os
+import zipfile
+import urllib.request
+
+import numpy as np
+import pandas as pd
+import pyfixest as pf
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+from matplotlib.ticker import FuncFormatter
+
+# ===========================================================================
+# 0. Constantes
+# ===========================================================================
+DATA_URL = "https://www.cepii.fr/DATA_DOWNLOAD/gravity/data/Gravity_csv_V202211.zip"
+WORKDIR = "./gravity_work"
+UMA = ["DZA", "LBY", "MAR", "MRT", "TUN"]
+YEAR_MIN, YEAR_MAX = 2000, 2019
+
+BASE_VARS = "ln_pop_o + ln_pop_d + ln_pib_o + ln_pib_d + fta_wto + CC + LC + FC + FCLC + CCFC + CCLC + CCLCFC + ln_D"
+FE_VARS = "fta_wto + CC + LC + FC + FCLC + CCFC + CCLC + CCLCFC + ln_D"
+
+PALETTE_BASE = "#7A9CC6"   # bleu clair - spécification baseline (sans EF)
+PALETTE_FE = "#1F3864"     # bleu foncé - spécification à effets fixes (retenue)
+PALETTE_IM = "#C6884A"     # orange - importations, pour distinguer d'exports
+
+
+# ===========================================================================
+# 1. Téléchargement, filtrage, construction des variables
+# ===========================================================================
+def download_and_extract():
+    os.makedirs(WORKDIR, exist_ok=True)
+    zip_path = os.path.join(WORKDIR, "gravity.zip")
+    if not os.path.exists(zip_path):
+        print("Téléchargement du jeu de données CEPII Gravity (~200 Mo)...")
+        urllib.request.urlretrieve(DATA_URL, zip_path)
+    extract_dir = os.path.join(WORKDIR, "gravity_data")
+    if not os.path.exists(extract_dir):
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(extract_dir)
+    return os.path.join(extract_dir, "Gravity_V202211.csv")
+
+
+def load_filtered_panel(csv_path):
+    cols = ["year", "iso3_o", "iso3_d", "country_exists_o", "country_exists_d",
+            "contig", "comlang_off", "comcol", "col45", "distw_harmonic", "distcap",
+            "pop_o", "pop_d", "gdp_o", "gdp_d", "fta_wto",
+            "tradeflow_imf_o", "tradeflow_imf_d", "tradeflow_baci"]
+    chunks = []
+    for chunk in pd.read_csv(csv_path, usecols=cols, chunksize=500_000, low_memory=False):
+        chunk = chunk[(chunk.year >= YEAR_MIN) & (chunk.year <= YEAR_MAX)]
+        chunk = chunk[chunk.iso3_o != chunk.iso3_d]
+        chunk = chunk[(chunk.country_exists_o == 1) & (chunk.country_exists_d == 1)]
+        chunks.append(chunk)
+    return pd.concat(chunks, ignore_index=True)
+
+
+def build_variables(df):
+    df = df.copy()
+    df["dist"] = df["distw_harmonic"].fillna(df["distcap"])
+    df["CC"] = df["comcol"].fillna(0).astype(int)       # colonisation commune post-1945
+    df["LC"] = df["comlang_off"].fillna(0).astype(int)  # langue officielle commune
+    df["FC"] = df["contig"].fillna(0).astype(int)       # frontière commune
+    df["fta_wto"] = df["fta_wto"].fillna(0).astype(int)
+    df["FCLC"] = df.FC * df.LC
+    df["CCFC"] = df.CC * df.FC
+    df["CCLC"] = df.CC * df.LC
+    df["CCLCFC"] = df.CC * df.LC * df.FC
+    for v in ["pop_o", "pop_d", "gdp_o", "gdp_d", "dist"]:
+        df = df[df[v] > 0]
+    df["ln_pop_o"] = np.log(df.pop_o)
+    df["ln_pop_d"] = np.log(df.pop_d)
+    df["ln_pib_o"] = np.log(df.gdp_o)
+    df["ln_pib_d"] = np.log(df.gdp_d)
+    df["ln_D"] = np.log(df.dist)
+    df["exp_year"] = df.iso3_o + "_" + df.year.astype(str)
+    df["imp_year"] = df.iso3_d + "_" + df.year.astype(str)
+    return df
+
+
+# ===========================================================================
+# 2. Estimation PPML (baseline et gravité structurelle à effets fixes)
+# ===========================================================================
+def fit_models(df, dep_var):
+    dfx = df.dropna(subset=[dep_var, "ln_pop_o", "ln_pop_d", "ln_pib_o", "ln_pib_d", "ln_D"]).copy()
+    m_base = pf.fepois(f"{dep_var} ~ {BASE_VARS}", data=dfx, vcov={"CRV1": "iso3_o+iso3_d"})
+    m_fe = pf.fepois(f"{dep_var} ~ {FE_VARS} | exp_year + imp_year", data=dfx, vcov={"CRV1": "iso3_o+iso3_d"})
+    # IMPORTANT : type="response" pour obtenir le commerce prédit en niveau
+    # (le défaut de pyfixest renvoie le prédicteur linéaire en log)
+    dfx["pred_base"] = m_base.predict(newdata=dfx, type="response")
+    dfx["pred_fe"] = m_fe.predict(newdata=dfx, type="response")
+    return m_base, m_fe, dfx
+
+
+# ===========================================================================
+# 3. Potentiel commercial : agrégé/par pays, et bilatéral
+# ===========================================================================
+def potential_ratio(df, dep_var, pred_col):
+    """Ratio commerce effectif / commerce potentiel, agrégé UMA et par pays
+    exportateur (somme des flux 2000-2019 sur somme des valeurs prédites)."""
+    uma = df[(df.iso3_o.isin(UMA)) & (df.iso3_d.isin(UMA))]
+    out = {"aggregate": uma[dep_var].sum() / uma[pred_col].sum()}
+    for c in UMA:
+        sub = uma[uma.iso3_o == c]
+        if len(sub):
+            out[c] = sub[dep_var].sum() / sub[pred_col].sum()
+    return out
+
+
+def bilateral_potential(df, dep_var, pred_col, spec_label):
+    """Ratio commerce effectif / commerce potentiel pour chaque paire ordonnée
+    (exportateur, importateur) au sein de l'UMA — somme des flux annuels 2000-2019
+    sur somme des valeurs prédites par le modèle sur la même période.
+
+    Un ratio > 1 (>100 %) signifie que le commerce bilatéral observé dépasse la
+    valeur prédite par la gravité (compte tenu de la taille économique des deux
+    pays, de la distance et des liens culturels/institutionnels communs) ; un
+    ratio < 1 (<100 %) signifie un commerce bilatéral inférieur au potentiel
+    estimé. Comme pour le ratio agrégé, ce n'est pas une "cible normative" :
+    c'est une mesure descriptive, sensible au nombre d'observations disponibles
+    pour la paire (colonne n_annees) et à la spécification retenue.
+    """
+    uma = df[(df.iso3_o.isin(UMA)) & (df.iso3_d.isin(UMA)) & (df.iso3_o != df.iso3_d)]
+    rows = []
+    for (o, d), g in uma.groupby(["iso3_o", "iso3_d"]):
+        actual_sum = g[dep_var].sum()
+        pred_sum = g[pred_col].sum()
+        ratio = actual_sum / pred_sum if pred_sum > 0 else np.nan
+        rows.append({
+            "exportateur": o,
+            "importateur": d,
+            "n_annees": len(g),
+            "commerce_effectif_cumule": actual_sum,
+            "commerce_potentiel_cumule": pred_sum,
+            "ratio_potentiel": ratio,
+            "ratio_potentiel_pct": 100 * ratio if pd.notna(ratio) else np.nan,
+            "specification": spec_label,
+        })
+    return pd.DataFrame(rows).sort_values(["exportateur", "importateur"]).reset_index(drop=True)
+
+
+# ===========================================================================
+# 4. Figures
+# ===========================================================================
+def plot_ratio_agrege(ratios_ex_base, ratios_ex_fe, ratios_im_base, ratios_im_fe,
+                       out_path="figure_ratio_agrege.png"):
+    """Ratio agrégé UMA — barres groupées, baseline vs effets fixes, exports vs imports."""
+    labels = ["Exportations", "Importations"]
+    base_vals = [ratios_ex_base["aggregate"], ratios_im_base["aggregate"]]
+    fe_vals = [ratios_ex_fe["aggregate"], ratios_im_fe["aggregate"]]
+
+    x = np.arange(len(labels))
+    width = 0.32
+
+    fig, ax = plt.subplots(figsize=(6.5, 5))
+    b1 = ax.bar(x - width / 2, base_vals, width, label="Sans effets fixes (réplication)",
+                color=PALETTE_BASE, edgecolor="white")
+    b2 = ax.bar(x + width / 2, fe_vals, width, label="Effets fixes exp-année / imp-année",
+                color=PALETTE_FE, edgecolor="white")
+
+    ax.axhline(1.0, color="#888888", linestyle="--", linewidth=1)
+
+    for bars in (b1, b2):
+        for rect in bars:
+            h = rect.get_height()
+            ax.annotate(f"{h * 100:.0f} %", xy=(rect.get_x() + rect.get_width() / 2, h),
+                        xytext=(0, 4), textcoords="offset points", ha="center",
+                        fontsize=10, fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=11)
+    ax.set_ylabel("Ratio commerce effectif / commerce potentiel", fontsize=10.5)
+    ax.set_title("Ratio agrégé de réalisation du potentiel commercial intra-UMA\n(2000-2019, sensibilité à la spécification)",
+                  fontsize=12, fontweight="bold", pad=14)
+    ax.set_ylim(0, max(base_vals + fe_vals) * 1.3)
+    ax.text(-0.5, 1.0, "potentiel atteint (100 %)", fontsize=8.5,
+            color="#666666", ha="left", va="bottom", transform=ax.transData)
+    ax.legend(frameon=False, fontsize=9.5, loc="upper left", bbox_to_anchor=(0, -0.08), ncol=1)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"Figure sauvegardée : {out_path}")
+
+
+def plot_ratio_pays_fe(ratios_ex_fe, ratios_im_fe, out_path="figure_ratio_pays.png"):
+    """Ratio par pays exportateur — spécification à effets fixes uniquement
+    (la plus fiable méthodologiquement), exports vs imports."""
+    countries = [c for c in UMA if c in ratios_ex_fe and c in ratios_im_fe]
+    ex_vals = [ratios_ex_fe[c] for c in countries]
+    im_vals = [ratios_im_fe[c] for c in countries]
+
+    order = np.argsort([-(e + i) / 2 for e, i in zip(ex_vals, im_vals)])
+    countries = [countries[i] for i in order]
+    ex_vals = [ex_vals[i] for i in order]
+    im_vals = [im_vals[i] for i in order]
+
+    x = np.arange(len(countries))
+    width = 0.32
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    b1 = ax.bar(x - width / 2, ex_vals, width, label="Exportations", color=PALETTE_FE, edgecolor="white")
+    b2 = ax.bar(x + width / 2, im_vals, width, label="Importations", color=PALETTE_IM, edgecolor="white")
+
+    ax.axhline(1.0, color="#888888", linestyle="--", linewidth=1)
+
+    for bars in (b1, b2):
+        for rect in bars:
+            h = rect.get_height()
+            ax.annotate(f"{h * 100:.0f} %", xy=(rect.get_x() + rect.get_width() / 2, h),
+                        xytext=(0, 4), textcoords="offset points", ha="center",
+                        fontsize=9.5, fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(countries, fontsize=11)
+    ax.set_ylabel("Ratio commerce effectif / commerce potentiel", fontsize=10.5)
+    ax.set_title("Ratio de réalisation du potentiel commercial par pays\n(spécification à effets fixes, 2000-2019)",
+                  fontsize=12, fontweight="bold", pad=14)
+    ax.legend(frameon=False, fontsize=9.5)
+    ax.spines[["top", "right"]].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"Figure sauvegardée : {out_path}")
+
+
+def plot_bilateral_heatmap(bilat_df, out_path="figure_bilateral_heatmap.png",
+                            value_col="ratio_potentiel", title_suffix="exportations"):
+    """Matrice 5x5 des ratios bilatéraux, en %, échelle de couleur logarithmique
+    centrée sur 100 % (les ratios bilatéraux varient très fortement : de <5 % à
+    >800 % selon les paires, une échelle linéaire écraserait les petites valeurs)."""
+    mat = bilat_df.pivot(index="exportateur", columns="importateur", values=value_col)
+    mat = mat.reindex(index=UMA, columns=UMA)
+
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+    norm = LogNorm(vmin=max(mat.min().min(), 0.01), vmax=mat.max().max())
+    im = ax.imshow(mat.values, cmap="RdBu_r", norm=norm)
+
+    ax.set_xticks(range(len(UMA)))
+    ax.set_xticklabels(UMA, fontsize=10.5)
+    ax.set_yticks(range(len(UMA)))
+    ax.set_yticklabels(UMA, fontsize=10.5)
+    ax.set_xlabel("Importateur", fontsize=10.5)
+    ax.set_ylabel("Exportateur", fontsize=10.5)
+
+    for i in range(len(UMA)):
+        for j in range(len(UMA)):
+            val = mat.values[i, j]
+            if np.isnan(val):
+                ax.text(j, i, "—", ha="center", va="center", fontsize=10, color="#999999")
+                continue
+            lum = norm(val)
+            color = "white" if (lum < 0.25 or lum > 0.75) else "black"
+            ax.text(j, i, f"{val * 100:.0f} %", ha="center", va="center", fontsize=10.5,
+                    color=color, fontweight="bold")
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.yaxis.set_major_formatter(FuncFormatter(lambda v, pos: f"{v * 100:.0f} %"))
+    cbar.set_label("Commerce effectif / potentiel\n(échelle log, 100 % = potentiel atteint)", fontsize=9)
+
+    ax.set_title(f"Potentiel commercial bilatéral intra-UMA — {title_suffix}\n"
+                 "(spécification à effets fixes, cumul 2000-2019)",
+                 fontsize=12, fontweight="bold", pad=14)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    print(f"Figure sauvegardée : {out_path}")
+
+
+# ===========================================================================
+# 5. Programme principal
+# ===========================================================================
+def main():
+    csv_path = download_and_extract()
+    print("Chargement et filtrage du panel (2000-2019)...")
+    raw = load_filtered_panel(csv_path)
+    df = build_variables(raw)
+    print(f"Panel final : {df.shape[0]} observations")
+
+    df["EX"] = df["tradeflow_imf_o"]
+    df["IM"] = df["tradeflow_imf_d"]
+    df["TRD_BACI"] = df["tradeflow_baci"]
+
+    print("\n=== Estimation EXPORTS (tradeflow_imf_o) ===")
+    m_ex_base, m_ex_fe, df_ex = fit_models(df, "EX")
+    print(m_ex_base.summary())
+    print(m_ex_fe.summary())
+
+    print("\n=== Estimation IMPORTS (tradeflow_imf_d) ===")
+    m_im_base, m_im_fe, df_im = fit_models(df, "IM")
+    print(m_im_base.summary())
+    print(m_im_fe.summary())
+
+    print("\n=== Ratios de potentiel commercial intra-UMA, agrégé et par pays (2000-2019) ===")
+    ratios_ex_base = potential_ratio(df_ex, "EX", "pred_base")
+    ratios_ex_fe = potential_ratio(df_ex, "EX", "pred_fe")
+    ratios_im_base = potential_ratio(df_im, "IM", "pred_base")
+    ratios_im_fe = potential_ratio(df_im, "IM", "pred_fe")
+    print("EXPORTS - baseline :", ratios_ex_base)
+    print("EXPORTS - structurel (EF) :", ratios_ex_fe)
+    print("IMPORTS - baseline :", ratios_im_base)
+    print("IMPORTS - structurel (EF) :", ratios_im_fe)
+
+    print("\n=== Robustesse : flux BACI (harmonisés) en variable dépendante ===")
+    m_baci_base, m_baci_fe, df_baci = fit_models(df, "TRD_BACI")
+    print("BACI - structurel (EF) :", potential_ratio(df_baci, "TRD_BACI", "pred_fe"))
+
+    # --- Potentiel bilatéral (4 spécifications) --------------------------------
+    print("\n=== Potentiel commercial bilatéral intra-UMA (exportations, EF) ===")
+    bilat_ex_base = bilateral_potential(df_ex, "EX", "pred_base", "EXPORTS - baseline")
+    bilat_ex_fe = bilateral_potential(df_ex, "EX", "pred_fe", "EXPORTS - structurel (EF)")
+    bilat_im_base = bilateral_potential(df_im, "IM", "pred_base", "IMPORTS - baseline")
+    bilat_im_fe = bilateral_potential(df_im, "IM", "pred_fe", "IMPORTS - structurel (EF)")
+    print(bilat_ex_fe.to_string(index=False))
+
+    bilat_all = pd.concat([bilat_ex_base, bilat_ex_fe, bilat_im_base, bilat_im_fe], ignore_index=True)
+    bilat_all.to_csv("potentiel_bilateral_uma.csv", index=False)
+    print("\nTableau bilatéral complet (4 spécifications) exporté : potentiel_bilateral_uma.csv")
+
+    # --- Export du tableau agrégé/par pays --------------------------------------
+    agg_rows = []
+    for label, ratios in [
+        ("EXPORTS - baseline", ratios_ex_base),
+        ("EXPORTS - structurel (EF)", ratios_ex_fe),
+        ("IMPORTS - baseline", ratios_im_base),
+        ("IMPORTS - structurel (EF)", ratios_im_fe),
+    ]:
+        for pays, ratio in ratios.items():
+            agg_rows.append({"specification": label, "pays_ou_agregat": pays,
+                              "ratio_potentiel": ratio, "ratio_potentiel_pct": 100 * ratio})
+    pd.DataFrame(agg_rows).to_csv("potentiel_agrege_uma.csv", index=False)
+    print("Tableau agrégé/par pays exporté : potentiel_agrege_uma.csv")
+
+    # --- Figures ------------------------------------------------------------
+    plot_ratio_agrege(ratios_ex_base, ratios_ex_fe, ratios_im_base, ratios_im_fe)
+    plot_ratio_pays_fe(ratios_ex_fe, ratios_im_fe)
+    plot_bilateral_heatmap(bilat_ex_fe, title_suffix="exportations")
+
+    print("\nTerminé. Fichiers produits : potentiel_agrege_uma.csv, potentiel_bilateral_uma.csv, "
+          "figure_ratio_agrege.png, figure_ratio_pays.png, figure_bilateral_heatmap.png")
+
+
+if __name__ == "__main__":
+    main()

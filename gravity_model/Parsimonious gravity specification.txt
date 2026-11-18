@@ -1,0 +1,143 @@
+"""
+Parsimonious (no-interaction) PPML gravity specification
+==========================================================
+Reproduces the coefficients reported in the new fourth column
+("Parsimonious Specification (No Interactions)") of Tables 3 and 4
+of the manuscript.
+
+It re-estimates the same exporter-year / importer-year fixed-effects
+PPML gravity equations as the paper's "Structural Gravity" column,
+but WITHOUT the four higher-order interaction terms
+(FC×LC, CC×FC, CC×LC, CC×LC×FC) — i.e. only the five core,
+theoretically justified bilateral covariates:
+    - fta_wto : membership in a trade agreement
+    - CC      : common colonization      (CEPII "comcol")
+    - LC      : common official language (CEPII "comlang_off")
+    - FC      : contiguous border        (CEPII "contig")
+    - ln_D    : log of bilateral distance
+
+Data: CEPII Gravity database, version V202211
+      (Conte, Cotterlaz & Mayer, 2022)
+      https://www.cepii.fr/CEPII/en/bdd_modele/presentation.asp?id=8
+
+Requires: pandas, pyfixest  (pip install pandas pyfixest --break-system-packages)
+"""
+
+import os
+import zipfile
+import urllib.request
+
+import pandas as pd
+import pyfixest as pf
+
+# ----------------------------------------------------------------------
+# 1. Download & extract the CEPII Gravity V202211 CSV (~200 MB zipped)
+# ----------------------------------------------------------------------
+
+DATA_DIR = "gravity_data"
+ZIP_PATH = os.path.join(DATA_DIR, "gravity.zip")
+EXTRACT_DIR = os.path.join(DATA_DIR, "extracted")
+CSV_URL = "https://www.cepii.fr/DATA_DOWNLOAD/gravity/data/Gravity_csv_V202211.zip"
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+if not os.path.exists(ZIP_PATH):
+    print("Downloading CEPII Gravity V202211 ...")
+    urllib.request.urlretrieve(CSV_URL, ZIP_PATH)
+
+if not os.path.exists(EXTRACT_DIR):
+    print("Extracting ...")
+    with zipfile.ZipFile(ZIP_PATH, "r") as z:
+        z.extractall(EXTRACT_DIR)
+
+# The zip also contains several small auxiliary label/lookup files
+# (Countries_*.csv, Label_*.csv); pick the main data file specifically.
+candidates = [
+    f for f in os.listdir(EXTRACT_DIR)
+    if f.lower().startswith("gravity_") and f.lower().endswith(".csv")
+]
+csv_path = os.path.join(EXTRACT_DIR, candidates[0])
+
+# ----------------------------------------------------------------------
+# 2. Load only the columns we need (the full file is ~4.7M rows x 87
+#    columns; loading everything risks an out-of-memory kill).
+# ----------------------------------------------------------------------
+
+USECOLS = [
+    "year", "iso3_o", "iso3_d",
+    "country_exists_o", "country_exists_d",
+    "dist", "contig", "comlang_off", "comcol",
+    "pop_o", "pop_d", "gdp_o", "gdp_d",
+    "fta_wto",
+    "tradeflow_imf_o", "tradeflow_imf_d",
+]
+
+print("Loading CSV ...")
+df = pd.read_csv(csv_path, usecols=USECOLS)
+
+# ----------------------------------------------------------------------
+# 3. Sample filters (identical to the paper's Tables 3-4 sample)
+# ----------------------------------------------------------------------
+
+df = df[
+    (df["year"] >= 2000) & (df["year"] <= 2019)
+    & (df["iso3_o"] != df["iso3_d"])          # exclude self-trade
+    & (df["country_exists_o"] == 1)
+    & (df["country_exists_d"] == 1)
+    & (df["gdp_o"] > 0) & (df["gdp_d"] > 0)
+    & (df["pop_o"] > 0) & (df["pop_d"] > 0)
+    & (df["dist"] > 0)
+].copy()
+
+# ----------------------------------------------------------------------
+# 4. Build the parsimonious specification's variables
+# ----------------------------------------------------------------------
+
+import numpy as np
+
+df["ln_D"] = np.log(df["dist"])
+# A small number of pairs (mostly involving dependent territories, e.g.
+# ABW-CUW) have NaN rather than 0 for comcol/comlang_off in the raw
+# CEPII file; treated as 0 (no common colonizer / no common official
+# language), consistent with fta_wto below. Left unfilled, pyfixest
+# silently drops these ~4,262 rows and understates N relative to the
+# paper's reported sample.
+df["CC"] = df["comcol"].fillna(0)
+df["LC"] = df["comlang_off"].fillna(0)
+df["FC"] = df["contig"].fillna(0)
+df["fta_wto"] = df["fta_wto"].fillna(0)
+
+# Export and import equations are estimated on two distinct samples:
+# each requires its own trade-flow variable to be non-missing
+# (IMF Direction of Trade Statistics coverage differs by direction).
+exp_df = df[df["tradeflow_imf_o"].notna()].copy()
+imp_df = df[df["tradeflow_imf_d"].notna()].copy()
+
+print(f"Export sample: {len(exp_df):,} observations")
+print(f"Import sample: {len(imp_df):,} observations")
+
+# ----------------------------------------------------------------------
+# 5. PPML estimation (pyfixest), exporter-year + importer-year fixed
+#    effects, standard errors clustered by exporter and importer
+#    country (CRV1, matching the paper's Tables 3-4).
+# ----------------------------------------------------------------------
+
+FORMULA_EXP = "tradeflow_imf_o ~ fta_wto + CC + LC + FC + ln_D | iso3_o^year + iso3_d^year"
+FORMULA_IMP = "tradeflow_imf_d ~ fta_wto + CC + LC + FC + ln_D | iso3_o^year + iso3_d^year"
+
+print("\nEstimating export equation ...")
+m_exp = pf.fepois(
+    FORMULA_EXP,
+    data=exp_df,
+    vcov={"CRV1": "iso3_o+iso3_d"},
+)
+print(m_exp.summary())
+
+print("\nEstimating import equation ...")
+m_imp = pf.fepois(
+    FORMULA_IMP,
+    data=imp_df,
+    vcov={"CRV1": "iso3_o+iso3_d"},
+)
+print(m_imp.summary())
+
